@@ -5,12 +5,14 @@ import asyncio
 import coloredlogs
 import logging
 import yaml
+import signal
+import sys
+
 import mqttclient
 import mqttserver
 import responderapp
-import signal
-import sys
 import task_logger
+
 
 class Main:
   config = {}

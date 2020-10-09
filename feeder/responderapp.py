@@ -2,25 +2,44 @@
 
 from hashlib import sha1
 from uvicorn import Config, Server
+from tortoise.contrib.starlette import register_tortoise
 import json
 import logging
 import os
 import responder
 import sys
 
+from models import Gateways
+import config
+
+description = "A PetNet Feeder V2 controller server"
+contact = {
+  "url": "https://github.com/tedder/petnet-feeder-service",
+}
+license = {
+  "name": "MIT License",
+  "url": "https://opensource.org/licenses/MIT",
+}
+
+# Create the RESPONDER app
+# https://responder.kennethreitz.org/en/latest/quickstart.html
+app = responder.API(
+  title="PetNet Feeder Service",
+  version="1.0",
+  openapi="3.0.2",
+  description=description,
+  contact=contact,
+  license=license,
+)
+
+register_tortoise(
+  app, db_url=config.DB_DSN, modules={"models": ["models"]}, generate_schemas=True
+)
+
 # Application we will run as
 APPLICATION_ID = "38973487e8241ea4483e88ef8ca7934c8663dc25"
 
 mqtt_client = None
-
-# Map of all the gateways & devices for now
-# Each gateway contains a dictionary of devices
-# Likely migrate this to an actual database later
-gateways = {}
-
-# Create the RESPONDER app
-# https://responder.kennethreitz.org/en/latest/quickstart.html
-app = responder.API()
 
 log = logging.getLogger('responderapp')
 
@@ -58,6 +77,11 @@ def jsonResponse(resp, obj):
   log.debug(f"response json: {resp.content}")
   resp.headers.update({'Content-Type' : 'application/json;charset=UTF-8'})
 
+
+@app.route('/api/gateways')
+async def list_gateways(req, resp):
+  gateways = await Gateways.all()
+  resp.media = {"gateways": [{gateway.hid: gateway.name} for gateway in gateways]}
 
 @app.route('/api/{gateway_id}/button')
 class ButtonResource:
@@ -116,24 +140,25 @@ async def welcome(req, resp):
 
 @app.route('/', default=True)
 async def welcome_html(req, resp):
-  resp.html = app.template('welcome.html', gateways=gateways.keys())
+  gateways = await Gateways.all()
+  resp.html = app.template('welcome.html', gateways=[x.hid for x in gateways])
 
-
-def get_gateways(req, resp):
+async def get_gateways(req, resp):
+  gateways = await Gateways.all()
   gatewayObjects = [{
-    "hid" : x,
-    "pri" : "arw:pgs:gwy:" + x,
+    "hid" : x.hid,
+    "pri" : "arw:pgs:gwy:" + x.hid,
     "applicationHid" : APPLICATION_ID,
     "softwareName" : "SMART FEEDER",
     "softwareReleaseName" : "SMART FEEDER",
     "type" : "SMART FEEDER"
-  } for x in gateways.keys()]
+  } for x in gateways]
   jsonResponse(resp, toListing(gatewayObjects))
 
 @app.route('/api/v1/kronos/gateways')
 async def manage_gateways(req, resp):
   if not req.method == 'post':
-    return get_gateways(req, resp)
+    return await get_gateways(req, resp)
   #example of input data: {"name":"SF Gateway","uid":"smartfeeder-795ae773737d","osName":"FreeRTOS","type":"Local","softwareName":"SMART FEEDER","softwareVersion":"2.8.0","sdkVersion":"1.3.12"}
   payload = await req.media()
   log.info(f"gateways payload: {payload}")
@@ -150,9 +175,10 @@ async def manage_gateways(req, resp):
   gatewayHid = generateGatewayHid(payload['uid'])
 
   # Check if we already have this gateway
-  if gatewayHid in gateways:
+  gateway, created = await Gateways.get_or_create(hid=gatewayHid)
+  if not created:
     jsonResponse(resp, {
-      "hid" : gatewayHid,
+      "hid" : gateway.hid,
       #"links" : {},
       "message" : "gateway is already registered"
     })
@@ -162,7 +188,7 @@ async def manage_gateways(req, resp):
     # Add to our gateways
     gateways[gatewayHid] = {}
     jsonResponse(resp, {
-      "hid": gatewayHid,
+      "hid": gateway.hid,
       #"links": {},
       "message": "OK"
     })
@@ -180,7 +206,7 @@ async def manage_gateways(req, resp):
 @app.route('/api/v1/kronos/devices')
 async def manage_devices(req, resp):
   if not req.method == 'post':
-    return get_devices(req, resp)
+    return await get_devices(req, resp)
   # Handle POST (create)
   device = await req.media()
   log.info(f"devices payload: {device}")
@@ -198,12 +224,11 @@ async def manage_devices(req, resp):
     return
 
   # Ensure the gateway exists
-  if device['gatewayHid'] not in gateways:
+  gateway = await Gateways.get(hid=device['gatewayHid'])
+  if gateway is None:
     log.warning("device's gateway does not exist, returning 400")
     resp.status_code = app.status_codes.HTTP_400
     return
-  # Fetch the gateway HID
-  gatewayHid = device['gatewayHid']
 
   # Generate the HID
   hid = generateHid(device['uid'])
@@ -219,41 +244,35 @@ async def manage_devices(req, resp):
     #'enabled': True,
   }
 
-  # Check if we already have this device
-  if hid in gateways[gatewayHid]:
-    jsonResponse(resp, ret)
-    return
-  # else We don't have this device, so add it
-  gateways[gatewayHid][hid] = device
   # returning "already registered" (above) always.
-  #ret['message'] = 'device was registered successfully'
   jsonResponse(resp, ret)
 
 
-def get_devices(req, resp):
+async def get_devices(req, resp):
   # Handle GET (fetch)
   # Check if we want the devices of a specific gateway
   gatewayHid = req.params.get('gatewayHid')
   if gatewayHid:
     # Ensure the gateway exists
-    if gatewayHid not in gateways:
+    gateway = await Gateways.get(hid=gatewayHid)
+    if gateway is None:
       resp.status_code = app.status_codes.HTTP_400
       return
-    jsonResponse(resp, toListing(list(gateways[gatewayHid].values())))
+    jsonResponse(resp, toListing(list(gateway)))
     return
   else:
     # No specific gateway specified, return all devices for now
-    deviceLists = [x.values() for x in gateways.values()]
-    devices = [entry for sublist in deviceLists for entry in sublist]
-    jsonResponse(resp, toListing(devices))
+    gateways = await Gateways.all()
+    jsonResponse(resp, toListing(gateways))
     return
 
 
 # this response can (also) be seen here:
 # https://github.com/konexios/konexios-sdk-c/blob/master/src/arrow/api/gateway/gateway.c#L30
 @app.route('/api/v1/kronos/gateways/{gateway_id}/config')
-async def gateway_config(req, resp, gateway_id):
-  log.info(f"gw config headers: {req.headers}")
+async def gateway_config(req, resp, *, gateway_id):
+  gateway = await Gateways.get(hid=gateway_id)
+  log.info(f"Gateway {gateway.name} config headers: {req.headers}")
   jsonResponse(resp, {
     "cloudPlatform": "IotConnect",
     "key": {
@@ -265,20 +284,20 @@ async def gateway_config(req, resp, gateway_id):
 
 
 @app.route('/api/v1/kronos/gateways/{gateway_id}/checkin')
-async def gateway_checkin(req, resp, gateway_id):
+async def gateway_checkin(req, resp, *, gateway_id):
   log.info(f"gw config headers: {req.headers}")
-  if gateway_id not in gateways:
-      log.info(f"Adding gateway {gateway_id} to seen gateways")
-      gateways[gateway_id] = {}
+  gateway, created = await Gateways.get_or_create(hid=gateway_id)
+  log.info(f"Gateway {gateway.name} just checked in! Created={created}")
   jsonResponse(resp, {})
   resp.set_cookie('JSESSIONID', value='pjbKBnNnas6qblrovritCihhHivY2WjFHc--S97u')
 
 
 @app.route('/api/v1/core/events/{gateway_id}/received')
-async def events_received(req, resp, gateway_id):
+async def events_received(req, resp, *, gateway_id):
   log.info(f"gw config headers: {req.headers}")
+  gateway = await Gateways.get(hid=gateway_id)
   data = await req.content
-  log.info(f"request: {data}")
+  log.info(f"Gateway {gateway.name} requests: {data}")
   jsonResponse(resp, {})
   resp.set_cookie('JSESSIONID', value='pjbKBnNnas6qblrovritCihhHivY2WjFHc--S97u')
 
